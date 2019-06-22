@@ -13,9 +13,14 @@ defined( 'ABSPATH' ) or die( 'No script kiddies please!' );
 add_shortcode( "job_list", "job_list_func" );
 add_shortcode( "job_post", "job_post_func" );
 add_shortcode( "job_form", "job_form_func" );
+add_shortcode( "job_posting", "static_job_post_func" );
+add_shortcode( "update_mindscope_api_data", "update_mindscope_api_data_func" );
 
 //require_once 'vendor/autoload.php';
 //require_once 'php/form_action.php';
+
+require_once 'vendor/autoload.php';
+
 register_activation_hook( __FILE__ , 'mindscope_webint_api_install');
 register_deactivation_hook( __FILE__, 'mindscope_webint_api_remove') ;
 
@@ -30,12 +35,89 @@ add_action( 'wp_ajax_mindscope_generate_job_list', 'mindscope_ajax_job_list_func
 add_action( 'wp_ajax_nopriv_mindscope_generate_job_list', 'mindscope_ajax_job_list_function' );
 add_action( 'wp_ajax_mindscope_save_page_number', 'mindscope_ajax_save_page_number' );
 add_action( 'wp_ajax_nopriv_mindscope_save_page_number', 'mindscope_ajax_save_page_number' );
-// add_action( 'wp_enqueue_scripts', 'my_custom_styles', PHP_INT_MAX);
 
-// function my_custom_styles() {
-  // load_script_jquery();
-  // load_script_bootstrap();
-// }
+
+global $mindscope_api_db_version;
+$mindscope_api_db_version = "1.6";
+
+function update_mindscope_api_data_func()
+{
+	$delete_all_posts = $_GET['delete_all'];
+	$force_update = $_GET['force_update'];
+	
+	if ($delete_all_posts) {
+		delete_all_mindscope_job_posts();
+	}
+	else {
+		if (!get_option('mindscope_webint_api_company_name') ||
+				!get_option('mindscope_webint_api_website_url') ||
+				!get_option('mindscope_webint_api_logo_url') ||
+				!get_option('mindscope_webint_api_google_auth_filename') ||
+				!get_option('mindscope_webint_api_sitemap_url'))
+		{
+			return;
+		}
+		
+		if (!get_option('mindscope_api_job_page_update_datetime'))
+		{
+			update_option('mindscope_api_job_page_update_datetime', "2010-01-01 00:00:00", TRUE);
+		}
+		
+		$saved_update_datetime = get_option("mindscope_api_job_page_update_datetime");
+		
+		$update_datetime = strtotime($saved_update_datetime);
+		$update_datetime_add = $update_datetime+(60*1440);
+		$update_datetime_final = date("Y-m-d H:i:s", $update_datetime_add);
+		$current_datetime_string = date("Y-m-d H:i:s");
+
+		$date_expire = new DateTime($update_datetime_final);
+		$date_now = new DateTime($current_datetime_string);
+		
+		if ((get_option('mindscope_api_job_create_running') != 'true' && ($date_now > $date_expire)) || ($force_update))
+		{
+			ini_set('max_execution_time', 600);
+			ini_set('default_socket_timeout', 600);
+			set_time_limit(600);
+			
+			update_option('mindscope_api_job_create_running', 'true', TRUE);
+			
+			try 
+			{
+				create_job_pages();
+				update_job_pages();
+				delete_job_pages();
+				
+				$dt_now = date("Y-m-d H:i:s");
+				update_option('mindscope_api_job_page_update_datetime', $dt_now, TRUE);
+				
+				$sitemapurl = get_option('mindscope_webint_api_sitemap_url');
+				$f = file_get_contents('https://www.google.com/ping?sitemap=' . $sitemapurl);
+			}
+			catch (Exception $e)
+			{
+				//console_log($e);
+			}
+			
+			update_option('mindscope_api_job_create_running', 'false', TRUE);
+		}
+	}
+}
+
+function delete_all_mindscope_job_posts()
+{
+	global $wpdb;
+	
+	$posts = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}mindscope_api_jobpages");
+	if (count($posts) != 0)
+	{
+		foreach ($posts as $post)
+		{
+			if (wp_delete_post($post->postid, TRUE)) {
+				$wpdb->delete("{$wpdb->prefix}mindscope_api_jobpages", array('postid' => $post->postid), array("%d"));
+			}
+		}
+	}
+}
 
 function reset_cache()
 {
@@ -46,10 +128,6 @@ function reset_cache()
 	
 	$job_list_cache_dir = WP_CONTENT_DIR . '/endurance-page-cache/faq/_index.html';
   
-	// console_log(date("Y-m-d h:i:sa"));
-	// console_log(get_option("mindscope_webint_api_filter_datetime"));
-	// update_option("mindscope_webint_api_filter_datetime", "2010-01-01 00:00:00", TRUE);
-	// console_log(get_option("mindscope_webint_api_filter_datetime"));
 	if (file_exists($job_list_cache_dir))
 	{
 	  $timestamp = filemtime($job_list_cache_dir);
@@ -74,7 +152,501 @@ function reset_cache()
 	}
 }
 
+function get_google_job_post_javascript($job_details)
+{
+	// $filter = json_encode(array('ShowGoogleJobOrder'=>'Yes', 'filter'=>array('JobOrderID' => $joborder->jobOrderId)), JSON_FORCE_OBJECT);
+	// $job_result = cura_search_joborder($filter);
+	
+	// $job_details = $job_result->jobOrder[0];
+	
+	$company_name = get_option('mindscope_webint_api_company_name');
+	$website_url = get_option('mindscope_webint_api_website_url');
+	$logo_url = get_option('mindscope_webint_api_logo_url');
+	
+	$job_description = strip_tags($job_details->jobFunction, "<br><p><ul><li><h1><h2><h3><h4><h5><strong><em><b>");
+	
+	$web_pub_date = date_parse($job_details->webPublicationDate);
+	$web_pub_date_short = "";
+	if ($web_pub_date["error_count"] == 0)
+	{
+		$web_pub_date_short = $web_pub_date["year"] . "-" . $web_pub_date["month"] . "-" . $web_pub_date["day"];
+	}
+	
+	$google_javascript = '';
+	
+	$google_javascript .= '<script type="application/ld+json">';
+	
+	$job_post_json = array(
+		"@context" => "https://schema.org/",
+		"@type" => "JobPosting",
+		"title" => $job_details->position,
+		"description" => $job_description,
+		"identifier" => array(
+					"@type" => "PropertyValue",
+					"name" => $company_name,
+					"value" => strval($job_details->jobOrderId)
+				),
+		"datePosted" => $web_pub_date_short,
+		"hiringOrganization" => array(
+					"@type" => "Organization",
+					"name" => $company_name,
+					"sameAs" => $website_url,
+					"logo" => $logo_url
+				),
+		"jobLocation" => array(
+					"@type" => "Place",
+					"address" => array(
+							"@type" => "PostalAddress",
+							"streetAddress" => $job_details->street,
+							"addressLocality" => $job_details->city,
+							"addressRegion" => $job_details->province,
+							"postalCode" => $job_details->postalZip,
+							"addressCountry" => $job_details->country
+					)
+				)
+	);
+	
+	$google_javascript .= json_encode($job_post_json);
+	
+	$google_javascript .= '</script>';
+	
+	return $google_javascript;
+}
+
+function static_job_post_func ( $args )
+{
+	try
+	{
+		global $wpdb;
+		
+		load_script_jquery();
+		load_script_bootstrap();
+		load_style_mindscope_webint();
+		
+		//load_script_mindscope_webint();
+		
+		//$the_id = $_GET['id'];
+		$the_id = $args['id'];
+		$filter = json_encode(array('filter'=>array('JobOrderID' => $the_id)), JSON_FORCE_OBJECT);
+		$job_app_page_link = get_permalink(get_option('mindscope_webint_api_job_app_page'));
+		
+		$job_details = cura_search_joborder($filter);
+		
+		$url_encoded_title = urlencode($job_details->jobOrder[0]->position);
+
+		$job_func = $job_details->jobOrder[0]->jobFunction;
+		$job_req = $job_details->jobOrder[0]->jobRequirement;
+		$display_requirements = "";
+		
+		if (empty($job_req))
+		{
+			$display_requirements = "style='display: none;'";
+		}
+		
+		$google_js_filter = json_encode(array('ShowGoogleJobOrder'=>'Yes', 'filter'=>array('JobOrderID' => $the_id)), JSON_FORCE_OBJECT);
+		$job_result = cura_search_joborder($google_js_filter);
+		
+		$job_google_details = $job_result->jobOrder[0];
+		$google_javascript = get_google_job_post_javascript($job_google_details);
+		
+		$job_page = $wpdb->get_row("SELECT googlejobjs FROM {$wpdb->prefix}mindscope_api_jobpages WHERE jobid = {$the_id}");
+		$google_job_js_current = $job_page->googlejobjs;
+		if (is_null($google_job_js_current)) {
+			$google_job_js_current = "";
+		}
+		
+		if (!hash_equals($google_job_js_current, $google_javascript)) {
+			$result = $wpdb->update( 
+				$wpdb->prefix . 'mindscope_api_jobpages', 
+				array( 'updatedata' => 1,
+					   'googlejobjs' => $google_javascript,
+					   'updatedatetime' => current_time( 'mysql' )
+					 ),
+				array( 'jobid' => $the_id ), 
+				array( '%d',
+					   '%s',
+					   '%s'
+					 ), 
+				array( '%d' ) 
+			);
+		}
+
+		$return_html = "
+		{$google_javascript}
+		<div class='container' style='max-width: 900px; margin-left: auto; margin-right: auto;'>
+			<div class='row'>
+				<div class='col-12 d-none d-sm-block'>
+					<h2 class='h4-big api-color' style='word-wrap: break-word;'>{$job_details->jobOrder[0]->position}</h2>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col-12 d-block d-sm-none'>
+					<h2 class='h4-medium api-color' style='word-wrap: break-word;'>{$job_details->jobOrder[0]->position}</h2>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col-sm-3'>
+					<p><small>Division</small></p>
+					<p class='font-weight-bold'>{$job_details->jobOrder[0]->jobOrderDivision}</p>
+				</div>
+				<div class='col-sm-3'>
+					<p><small>Employment Type</small></p>
+					<p class='font-weight-bold'><i class='far fa-calendar-alt' style='margin-right: 5px;'></i>{$job_details->jobOrder[0]->employmentType}</p>
+				</div>
+				<div class='col-sm-3'>
+					<p><small>Location</small></p>
+					<p class='font-weight-bold'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$job_details->jobOrder[0]->city}, {$job_details->jobOrder[0]->province}</p>
+				</div>
+				<div class='col-sm-3'>
+					<a class='btn btn-primary btn-lg api-background-color api-border-color text-color-white' style='margin-top: 15px;' href='{$job_app_page_link}?id={$the_id}&job={$url_encoded_title}' role='button'>Apply</a>	
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col'>
+					<hr/>
+				</div>
+			</div>
+			<br>
+			<div class='row'>
+				<div class='col'>
+					<h4>Job Description:</h4>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col'>
+					{$job_func}
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col' {$display_requirements}>
+					<h4>Job Requirements:</h4>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col' {$display_requirements}>
+					{$job_req}
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col-sm-3'>
+				</div>
+				<div class='col-sm-3'>
+				</div>
+				<div class='col-sm-3'>
+				</div>
+				<div class='col-sm-3'>
+					<a class='btn btn-primary btn-lg api-background-color api-border-color text-color-white' href='{$job_app_page_link}?id={$the_id}&job={$url_encoded_title}' role='button'>Apply</a>
+				</div>
+			</div>
+		</div>
+		";
+		
+		//console_log($job_details);
+		
+		return $return_html;
+	}
+	catch (Exception $e)
+	{
+		//return "<p class='text-danger'>ERROR: Unable to get job information</p>";
+		
+		return "
+<div class='card'>
+  <div class='card-body'>
+    <h5 class='card-title text-danger'>ERROR</h5>
+    <p class='card-text'>Unable to get job information</p>
+  </div>
+</div>";
+	}
+	//console_log($args);
+	
+	//return $args['id'];
+}
+
+function add_new_job_page($joborder, $post_id, $job_desc_page) {
+	global $wpdb;
+	
+	$page_content = $job_desc_page->post_content;
+	$page_content = str_replace('[job_post]', '[job_posting id="'. $joborder->jobOrderId . '"]', $page_content);
+	//$page_content = "[job_list]";
+	
+	$_p = array();
+	$_p['post_title'] = $joborder->position;
+	$_p['post_status'] = $job_desc_page->post_status;
+	$_p['post_type'] = $job_desc_page->post_type;
+	$_p['comment_status'] = $job_desc_page->comment_status;
+	$_p['ping_status'] = $job_desc_page->ping_status;
+	$_p['post_content'] = $page_content;
+	$_p['post_parent'] = $job_desc_page->ID;
+	//$_p['post_category'] = array(1);
+	//$_p['page_template'] = $job_desc_page->page_template;
+	
+	$added_page_id = wp_insert_post($_p);
+	
+	if ($added_page_id != 0) {
+		
+		$status_code = call_google_index_api("URL_UPDATED", get_permalink($added_page_id));
+		$google_job_js = get_google_job_post_javascript($joborder);
+		
+		if (!is_numeric($status_code)) {
+			$status_code = 0;
+		}
+		
+		$wpdb->insert(
+			$wpdb->prefix . 'mindscope_api_jobpages',
+			array(
+				'jobid' => $joborder->jobOrderId,
+				'url' => get_permalink($added_page_id),
+				'createdatetime' => current_time( 'mysql' ),
+				'updatedatetime' => current_time( 'mysql' ),
+				'postid' => $added_page_id,
+				'indexapiresponsecode' => $status_code,
+				'googlejobjs' => $google_job_js
+			),
+			array(
+				'%d',
+				'%s',
+				'%s',
+				'%s',
+				'%d',
+				'%d',
+				'%s'
+			)
+		);
+		
+		$taxonomies = get_object_taxonomies($job_desc_page->post_type); // returns array of taxonomy names for post type, ex array("category", "post_tag");
+		foreach ($taxonomies as $taxonomy) {
+			$post_terms = wp_get_object_terms($post_id, $taxonomy, array('fields' => 'slugs'));
+			wp_set_object_terms($added_page_id, $post_terms, $taxonomy, false);
+		}
+		
+		//console_log('post id: ' . $post_id);
+		$post_meta_infos = $wpdb->get_results("SELECT meta_key, meta_value FROM $wpdb->postmeta WHERE post_id=$post_id");
+		if (count($post_meta_infos)!=0) {
+			$sql_query = "INSERT INTO $wpdb->postmeta (post_id, meta_key, meta_value) ";
+			foreach ($post_meta_infos as $meta_info) {
+				$meta_key = $meta_info->meta_key;
+				if( $meta_key == '_wp_old_slug' ) continue;
+				$job_post_short_code = '[job_posting id="@jobId"]';
+				$job_post_short_code = str_replace('@jobId', $joborder->jobOrderId, $job_post_short_code);
+				$meta_value = addslashes(str_replace('[job_post]', $job_post_short_code, $meta_info->meta_value));
+				$sql_query_sel[]= "SELECT $added_page_id, '$meta_key', '$meta_value'";
+			}
+			$sql_query.= implode(" UNION ALL ", $sql_query_sel);
+			//console_log($sql_query);
+			$wpdb->query($sql_query);
+		}	
+		
+		$brief_description = strip_tags(($joborder->briefDescription));
+		if (strlen($brief_description) > 120)
+		{
+			$brief_description = substr($brief_description, 0, 120);
+		}
+		
+		update_post_meta( $added_page_id, '_yoast_wpseo_title', $joborder->position );
+		update_post_meta( $added_page_id, '_yoast_wpseo_metadesc', $brief_description );
+	}
+}
+
+function update_existing_job_page($joborder, $post_id, $update_data)
+{
+	global $wpdb;
+	
+	$brief_description = strip_tags(($joborder->briefDescription));
+	if (strlen($brief_description) > 120)
+	{
+		$brief_description = substr($brief_description, 0, 120);
+	}
+	
+	update_post_meta( $post_id, '_yoast_wpseo_title', $joborder->position );
+	update_post_meta( $post_id, '_yoast_wpseo_metadesc', $brief_description );
+	
+	if ($update_data == 1) {
+		$job_page = get_post($post_id);
+		wp_update_post($job_page);
+		
+		$status_code = call_google_index_api("URL_UPDATED", get_permalink($post_id));
+		
+		$result = $wpdb->update( 
+				$wpdb->prefix . 'mindscope_api_jobpages', 
+				array( 'updatedata' => 0,
+					   'updatedatetime' => current_time( 'mysql' ),
+					   'indexapiresponsecode' => $status_code
+					 ),
+				array( 'jobid' => $joborder->jobOrderId ), 
+				array( '%d',
+					   '%s',
+					   '%d'
+					 ), 
+				array( '%d' ) 
+			);
+	}
+}
+
+function delete_existing_job_page($post_id, $url)
+{
+	global $wpdb;
+	
+	if ($post_id != null) {
+		wp_delete_post( $post_id, TRUE );
+		
+		$wpdb->delete("{$wpdb->prefix}mindscope_api_jobpages", array('postid' => $post_id), array("%d"));
+		
+		$status_code = call_google_index_api("URL_DELETED", $url);
+	}
+}
+
+function call_google_index_api($action, $url) {
+	$status_code = 0;
+	
+	if (!empty($action) && !empty($url))
+	{
+		$client = new Google_Client();
+		
+		$auth_file_name = get_option('mindscope_webint_api_google_auth_filename');
+		$auth_file_path = WP_CONTENT_DIR . '/plugins/mindscope-webint-api/' . $auth_file_name;
+
+		$client->setAuthConfig($auth_file_path);
+		$client->addScope('https://www.googleapis.com/auth/indexing');
+
+		$httpClient = $client->authorize();
+		$endpoint = 'https://indexing.googleapis.com/v3/urlNotifications:publish';
+
+		// Define contents here. The structure of the content is described in the next step.
+		$content = '{
+		"url": "' . $url . '",
+		"type": "' . $action . '"
+		}';
+
+		$response = $httpClient->post($endpoint, [ 'body' => $content ]);
+		$status_code = $response->getStatusCode();
+	}
+	
+	return $status_code;
+}
+
+function create_job_pages() {
+	global $wpdb;
+	
+	$filter = json_encode(array('Filter'=>(
+											array('JobOrderOpen'=>'Yes', 'JobOrderStatus'=>array('open', 'hold', 'hot'))),
+								'Order'=> array(
+												array('Field'=>'webPublicationDate', 'direction'=>'Desc'),
+												array('Field'=>'Division', 'direction'=>'Asc')),
+								'DisplayFields'=>
+											array('position', 'briefDescription')));
+	$job_list = cura_search_joborder($filter);
+	$post_id = get_option('mindscope_webint_api_job_desc_page');
+	$job_desc_page = get_post($post_id);
+	
+	if ($job_desc_page != null) {
+		
+		$page_count = 0;
+		foreach ($job_list->jobOrder as $value)
+		{
+			if ($page_count < 50)
+			{
+				if ($value->position != "")
+				{
+					$job_exists = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}mindscope_api_jobpages WHERE jobid = {$value->jobOrderId}");
+					//console_log($job_exists);
+					//if (0 == 0 ) {
+					if ($job_exists == 0 ) {
+						add_new_job_page($value, $post_id, $job_desc_page);
+						$page_count++;
+					}
+				}
+			}
+		}
+	}
+}
+
+function update_job_pages() {
+	global $wpdb;
+	
+	$filter = json_encode(array('Filter'=>(
+											array('JobOrderOpen'=>'Yes', 'JobOrderStatus'=>array('open', 'hold', 'hot'))),
+								'Order'=> array(
+												array('Field'=>'webPublicationDate', 'direction'=>'Desc'),
+												array('Field'=>'Division', 'direction'=>'Asc')),
+								'DisplayFields'=>
+											array('position', 'briefDescription')));
+	$job_list = cura_search_joborder($filter);
+
+
+	foreach ($job_list->jobOrder as $value)
+	{
+		if ($value->position != "")
+		{
+			$job_page = $wpdb->get_row("SELECT postid, ifnull(updatedata, 0) as updatedata FROM {$wpdb->prefix}mindscope_api_jobpages WHERE jobid = {$value->jobOrderId}");
+			//console_log($job_exists);
+			//if (0 == 0 ) {
+			if ($job_page->postid > 0 ) {
+				update_existing_job_page($value, $job_page->postid, $job_page->updatedata);
+			}
+		}
+	}
+}
+
+function delete_job_pages() {
+	global $wpdb;
+
+	$filter = json_encode(array('Filter'=>(
+											array('JobOrderOpen'=>'Yes', 'JobOrderStatus'=>array('open', 'hold', 'hot'))),
+								'Order'=> array(
+												array('Field'=>'webPublicationDate', 'direction'=>'Desc'),
+												array('Field'=>'Division', 'direction'=>'Asc')),
+								'DisplayFields'=>
+											array('position', 'briefDescription')));
+	$job_list = cura_search_joborder($filter);
+	
+	$job_list_A_array;
+	foreach ($job_list->jobOrder as $value)
+	{
+		$job_list_A_array[$value->jobOrderId] = $value->position;
+	}
+	
+	$job_posts = $wpdb->get_results("SELECT jobid, postid, url FROM wp_mindscope_api_jobpages");
+	
+	foreach ($job_posts as $post)
+	{
+		if ($job_list_A_array[$post->jobid] == null) {
+			delete_existing_job_page( $post->postid, $post->url ); 
+		}
+	}
+}
+
 function mindscope_webint_api_install() {
+	global $wpdb;
+	global $mindscope_api_db_version;
+	$installed_ver = get_option( "mindscope_api_db_version" );
+	
+	//console_log($installed_ver);
+	//console_log("test");
+	
+	if ( $installed_ver != $mindscope_api_db_version ) {
+		$table_name = $wpdb->prefix . 'mindscope_api_jobpages';
+		
+		$charset_collate = $wpdb->get_charset_collate();
+		
+		$sql = "CREATE TABLE $table_name (
+			id mediumint(9) NOT NULL AUTO_INCREMENT,
+			jobid int UNIQUE NOT NULL,
+			postid int NOT NULL,
+			url text NULL,
+			createdatetime datetime DEFAULT '0000-00-00 00:00:00' NOT NULL,
+			updatedatetime datetime NULL,
+			indexapiresponsecode int NULL,
+			googlejobjs text NULL,
+			updatedata tinyint NULL,
+			PRIMARY KEY  (id)
+		) $charset_collate;";
+		
+		require_once( ABSPATH . 'wp-admin/includes/upgrade.php' );
+		dbDelta( $sql );
+		
+		update_option('mindscope_api_db_version', $mindscope_api_db_version);
+	}
+	
         //global $wpdb;
 
         // $the_page_title = 'Job Details';
@@ -246,6 +818,31 @@ function mindscope_webint_api_options() {
         <input class="" type="text" name="recaptcha_site_secret" value="<?php echo get_option('mindscope_webtint_api_recaptcha_site_secret'); ?>" />
         </p>
 		
+		<p>
+		<label><?php _e("Company Name:", "mindscope-webint-api"); ?></label>
+		<input class="" type="text" name="company_name" value="<?php echo get_option('mindscope_webint_api_company_name'); ?>" />
+		</p>
+		
+		<p>
+		<label><?php _e("Website URL:", "mindscope-webint-api"); ?></label>
+		<input class="" type="text" name="website_url" value="<?php echo get_option('mindscope_webint_api_website_url'); ?>" />
+		</p>
+		
+		<p>
+		<label><?php _e("Logo URL:", "mindscope-webint-api"); ?></label>
+		<input class="" type="text" name="logo_url" value="<?php echo get_option('mindscope_webint_api_logo_url'); ?>" />
+		</p>
+		
+		<p>
+		<label><?php _e("Google Indexing API Autho Filename:", "mindscope-webint-api"); ?></label>
+		<input class="" type="text" name="auth_filename" value="<?php echo get_option('mindscope_webint_api_google_auth_filename'); ?>" />
+		</p>
+		
+		<p>
+		<label><?php _e("Sitemap XML URL:", "mindscope-webint-api"); ?></label>
+		<input class="" type="text" name="sitemap_url" value="<?php echo get_option('mindscope_webint_api_sitemap_url'); ?>" />
+		</p>
+		
         <input class="button button-primary" type="submit" value="<?php _e("Save", "mindscope-webint-api"); ?>" />
 
     </form>
@@ -263,6 +860,11 @@ function mindscope_webint_api_handle_save()
    $job_app_page = (!empty($_POST["api_job_app_page"])) ? $_POST["api_job_app_page"] : NULL;
    $recaptcha_site_key = (!empty($_POST["recaptcha_site_key"])) ? $_POST["recaptcha_site_key"] : NULL;
    $recaptcha_site_secret = (!empty($_POST["recaptcha_site_secret"])) ? $_POST["recaptcha_site_secret"] : NULL;
+   $company_name = (!empty($_POST["company_name"])) ? $_POST["company_name"] : NULL;
+   $website_url = (!empty($_POST["website_url"])) ? $_POST["website_url"] : NULL;
+   $logo_url = (!empty($_POST["logo_url"])) ? $_POST["logo_url"] : NULL;
+   $auth_filename = (!empty($_POST["auth_filename"])) ? $_POST["auth_filename"] : NULL;
+   $sitemap_url = (!empty($_POST["sitemap_url"])) ? $_POST["sitemap_url"] : NULL;
    
    // Update the values
    update_option( "mindscope_webtint_api_url", $url, TRUE );
@@ -272,6 +874,11 @@ function mindscope_webint_api_handle_save()
    update_option( "mindscope_webint_api_job_app_page", $job_app_page, TRUE );
    update_option( "mindscope_webtint_api_recaptcha_site_key", $recaptcha_site_key, TRUE );
    update_option( "mindscope_webtint_api_recaptcha_site_secret", $recaptcha_site_secret, TRUE );
+   update_option( "mindscope_webint_api_company_name", $company_name, TRUE );
+   update_option( "mindscope_webint_api_website_url", $website_url, TRUE );
+   update_option( "mindscope_webint_api_logo_url", $logo_url, TRUE );
+   update_option( "mindscope_webint_api_google_auth_filename", $auth_filename, TRUE );
+   update_option( "mindscope_webint_api_sitemap_url", $sitemap_url, TRUE );
    
    // Redirect back to settings page
    // The ?page=github corresponds to the "slug" 
@@ -430,6 +1037,7 @@ function mindscope_webint_api_form_handle_save()
 			  'lastName'=>$lastname,
 			  'middleName'=>$middlename,
 			  'emailAddress'=>$email,
+			  'marketingSourceName'=>'Website',
 			  'sendConfirmationEmail'=>'Yes',
 			  'address'=>(array(array('address'=>$address1, 'address2'=>$address2, 'city'=>$city, 'provinceId'=>$provincestate, 'PostalCode'=>$zippostal, 'default'=>'Yes'))),
 			  'phone'=>(array(array('value'=>$phone, 'default'=>'Yes'))),
@@ -761,74 +1369,79 @@ function job_post_func( $atts )
 	}
 }
 
-function generate_job_card ($value)
+function generate_job_card ($value, $url)
 {
-	$job_desc_page_link = get_permalink(get_option('mindscope_webint_api_job_desc_page'));
+	$return_list = "";
 	
-	$lower_city = strtolower($value->city);
-	$lower_province = strtolower($value->province);
-	$web_pub_date = date_parse($value->webPublicationDate);
-	$brief_description = strip_tags(($value->briefDescription));
-	if (strlen($brief_description) > 350)
+	if ($url != null)
 	{
-		$brief_description = substr($brief_description, 0, 350) . "...";
-	}
+		//$job_desc_page_link = get_permalink(get_option('mindscope_webint_api_job_desc_page'));
+	
+		$lower_city = strtolower($value->city);
+		$lower_province = strtolower($value->province);
+		$web_pub_date = date_parse($value->webPublicationDate);
+		$brief_description = strip_tags(($value->briefDescription));
+		if (strlen($brief_description) > 350)
+		{
+			$brief_description = substr($brief_description, 0, 350) . "...";
+		}
 
-	$web_pub_date_short = "";
-	if ($web_pub_date["error_count"] == 0)
-	{
-		$web_pub_date_short = $web_pub_date["month"] . "/" . $web_pub_date["day"] . "/" . $web_pub_date["year"];
+		$web_pub_date_short = "";
+		if ($web_pub_date["error_count"] == 0)
+		{
+			$web_pub_date_short = $web_pub_date["month"] . "/" . $web_pub_date["day"] . "/" . $web_pub_date["year"];
+		}
+		
+		$return_list .= "<div class='paginate'>";
+		$return_list .= "<div class='card job-list-card api-border-color' style='min-height: 202px;'>";
+		//$return_list .= "<div class='card-header'>{$value->jobOrderId}</div>";
+		$return_list .= "<div class='card-body'>";
+		//$return_list .= "<div class='card-title d-flex' style='margin-bottom: 0px;'><h3 class='api-color api-font-medium'><a href='{$job_desc_page_link}?id={$value->jobOrderId}'>{$value->position}</a></h3><span class='ml-auto d-none d-lg-block' style='margin-top: -12px;'><small>Posted: {$web_pub_date_short}<i class='far fa-calendar-alt' style='margin-left: 5px;'></i></small></span></div>";
+		$return_list .= "
+		<div class='card-title' style='margin-bottom: 0px;'>
+		<div class='container d-none d-lg-block' style='padding-left: 0px; padding-right: 0px; padding-top: 0px;'>
+			<div class='row'>
+				<div class='col-9'>
+					<h3 class='api-color'><a href='{$url}'>{$value->position}</a></h3>
+				</div>
+				<div class='col-3' style='text-align: right;'>
+					<small class='d-none d-lg-block'>Posted: {$web_pub_date_short}<i class='far fa-calendar-alt' style='margin-left: 5px;'></i></small>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col-12'>
+					<p class='font-weight-light text-capitalize'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$lower_city}, {$lower_province}</p>
+				</div>
+			</div>
+		</div>
+		<div class='container d-block d-lg-none' style='padding-left: 0px; padding-right: 0px;'>
+			<div class='row'>
+				<div class='col-12' style='padding-left: 0px; padding-right: 0px;'>
+					<h3 class='api-color'><a href='{$url}'>{$value->position}</a></h3>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col-12' style='padding-left: 0px; padding-right: 0px; margin-top: -10px;'>
+					<small><i class='far fa-calendar-alt' style='margin-right: 5px;'></i>{$web_pub_date_short}</small>
+				</div>
+			</div>
+			<div class='row'>
+				<div class='col-12' style='padding-left: 0px; padding-right: 0px; margin-top: 5px;'>
+					<p class='font-weight-light text-capitalize'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$lower_city}, {$lower_province}</p>
+				</div>
+			</div>
+		</div>
+		</div>";
+		//$return_list .= "<span class='ml-auto d-block d-lg-none' ><small><i class='far fa-calendar-alt' style='margin-right: 5px;'></i>{$web_pub_date_short}</small></span>";
+		//$return_list .= "<p class='font-weight-light text-capitalize' style='margin-bottom: 0px;'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$lower_city}</p>";
+		//$return_list .= "<p class='font-weight-light text-capitalize'>&nbsp;</p>";
+		//$return_list .= "<p class='card-text'>Change234 This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text.</p>";
+		$return_list .= "<p class='card-text api-font-small' style='font-size: 18px; margin-top: 25px;'>{$brief_description}</p>";
+		$return_list .= "</div>";
+		$return_list .= "</div>";
+		$return_list .= "<br>";
+		$return_list .= "</div>";
 	}
-	
-	$return_list .= "<div class='paginate'>";
-	$return_list .= "<div class='card job-list-card api-border-color' style='min-height: 202px;'>";
-	//$return_list .= "<div class='card-header'>{$value->jobOrderId}</div>";
-	$return_list .= "<div class='card-body'>";
-	//$return_list .= "<div class='card-title d-flex' style='margin-bottom: 0px;'><h3 class='api-color api-font-medium'><a href='{$job_desc_page_link}?id={$value->jobOrderId}'>{$value->position}</a></h3><span class='ml-auto d-none d-lg-block' style='margin-top: -12px;'><small>Posted: {$web_pub_date_short}<i class='far fa-calendar-alt' style='margin-left: 5px;'></i></small></span></div>";
-	$return_list .= "
-	<div class='card-title' style='margin-bottom: 0px;'>
-	<div class='container d-none d-lg-block' style='padding-left: 0px; padding-right: 0px; padding-top: 0px;'>
-		<div class='row'>
-			<div class='col-9'>
-				<h3 class='api-color'><a href='{$job_desc_page_link}?id={$value->jobOrderId}'>{$value->position}</a></h3>
-			</div>
-			<div class='col-3' style='text-align: right;'>
-				<small class='d-none d-lg-block'>Posted: {$web_pub_date_short}<i class='far fa-calendar-alt' style='margin-left: 5px;'></i></small>
-			</div>
-		</div>
-		<div class='row'>
-			<div class='col-12'>
-				<p class='font-weight-light text-capitalize'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$lower_city}, {$lower_province}</p>
-			</div>
-		</div>
-	</div>
-	<div class='container d-block d-lg-none' style='padding-left: 0px; padding-right: 0px;'>
-		<div class='row'>
-			<div class='col-12' style='padding-left: 0px; padding-right: 0px;'>
-				<h3 class='api-color'><a href='{$job_desc_page_link}?id={$value->jobOrderId}'>{$value->position}</a></h3>
-			</div>
-		</div>
-		<div class='row'>
-			<div class='col-12' style='padding-left: 0px; padding-right: 0px; margin-top: -10px;'>
-				<small><i class='far fa-calendar-alt' style='margin-right: 5px;'></i>{$web_pub_date_short}</small>
-			</div>
-		</div>
-		<div class='row'>
-			<div class='col-12' style='padding-left: 0px; padding-right: 0px; margin-top: 5px;'>
-				<p class='font-weight-light text-capitalize'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$lower_city}, {$lower_province}</p>
-			</div>
-		</div>
-	</div>
-	</div>";
-	//$return_list .= "<span class='ml-auto d-block d-lg-none' ><small><i class='far fa-calendar-alt' style='margin-right: 5px;'></i>{$web_pub_date_short}</small></span>";
-	//$return_list .= "<p class='font-weight-light text-capitalize' style='margin-bottom: 0px;'><i class='fas fa-map-marker-alt' style='margin-right: 5px;'></i>{$lower_city}</p>";
-	//$return_list .= "<p class='font-weight-light text-capitalize'>&nbsp;</p>";
-	//$return_list .= "<p class='card-text'>Change234 This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text. This is some example text.</p>";
-	$return_list .= "<p class='card-text api-font-small' style='font-size: 18px; margin-top: 25px;'>{$brief_description}</p>";
-	$return_list .= "</div>";
-	$return_list .= "</div>";
-	$return_list .= "<br>";
-	$return_list .= "</div>";
 	
     return $return_list;
 }
@@ -844,18 +1457,24 @@ function mindscope_ajax_save_page_number()
 
 function mindscope_ajax_job_list_function()
 {
+	global $wpdb;
+	$use_static_pages = true;
+	
+	// if (get_option('mindscope_api_job_create_running') != 'true')
+	// {
+		// update_option('mindscope_api_job_create_running', 'true', TRUE);
+		// create_job_pages();
+		// update_job_pages();
+		// delete_job_pages();
+		// update_option('mindscope_api_job_create_running', 'false', TRUE);
+	// }
+	
+	update_mindscope_api_data_func();
+	
 	$division = (!empty($_POST["division"])) ? $_POST["division"] : NULL;
 	$state = (!empty($_POST["state"])) ? $_POST["state"] : NULL;
 	$employment = (!empty($_POST["employment"])) ? $_POST["employment"] : NULL;
 	$keyword = (!empty($_POST["keyword"])) ? $_POST["keyword"] : NULL;
-	
-	//echo json_encode($division);
-	//exit;
-	
-	//$_SESSION["division"] = json_encode($division);
-	//$_SESSION["state"] = json_encode($state);
-	//$_SESSION["employment"] = json_encode($employment);
-	//$_SESSION["keyword"] = $keyword;
 	
 	$session_pagenumber = $_SESSION["JobListPageNumber"];
 	$pagenumber_html = "";
@@ -878,12 +1497,30 @@ function mindscope_ajax_job_list_function()
 	$return_list .= "<h5>@TotalJobs Jobs found</h5>";
 	
 	$total_jobs = 0;
+	
+	$job_posts = $wpdb->get_results("SELECT jobid, postid, url FROM wp_mindscope_api_jobpages", "OBJECT_K");
+	
 	foreach ($job_list->jobOrder as $value)
 	{
 		if ($value->position != "")
 		{
-			$return_list .= generate_job_card($value);
-			$total_jobs++;
+			$job_card = "";
+			
+			if ($use_static_pages)
+			{
+				$job_card = generate_job_card($value, $job_posts[$value->jobOrderId]->url);
+			}
+			else
+			{
+				$job_card = generate_job_card($value, $job_desc_page_link . "?id=" . $value->jobOrderId);
+			}
+			
+			if (!empty($job_card))
+			{
+				$return_list .= $job_card;
+				$total_jobs++;
+			}
+			
 		}
 	}
 	
@@ -921,14 +1558,6 @@ function job_list_func( $atts )
 		$state_arr = array();
 		$employment_arr = array();
 		$filter_from_storage = false;
-		
-		//if (!empty($_SESSION["division_filter_list"]) && !empty($_SESSION["state_filter_list"]) && !empty($_SESSION["employment_filter_list"]))
-		//{
-			//$from_session = true;
-			//$division_arr = json_decode($_SESSION["division_filter_list"]);
-			//$state_arr = json_decode($_SESSION["state_filter_list"]);
-			//$employment_arr = json_decode($_SESSION["employment_filter_list"]);
-		//}
 		
 		$saved_filter_datetime = get_option("mindscope_webint_api_filter_datetime");
 		$saved_division_filter = get_option("mindscope_webint_api_division_filter");
@@ -1112,27 +1741,12 @@ function job_list_func( $atts )
 				}
 			}
 		}
-
-		//$session_division = (!empty($_SESSION["division"]) && $_SESSION["division"] != 'null') ? json_decode($_SESSION["division"]) : array();
-		//$session_state = (!empty($_SESSION["state"]) && $_SESSION["state"] != 'null') ? json_decode($_SESSION["state"]) : array();
-		//$session_employment = (!empty($_SESSION["employment"]) && $_SESSION["employment"] != 'null') ? json_decode($_SESSION["employment"]) : array();
-		//$session_division = [];
-		//$session_state = [];
-		//$session_employment = [];
 		
 		$checked_checkbox = "";
 		$division_count = 0;
 		sort($division_arr);
 		foreach($division_arr as $value)
 		{
-			//if (in_array($value, $session_division))
-			//{
-			//	$checked_checkbox = "checked";	
-			//}
-			//else
-			//{
-			//	$checked_checkbox = "";
-			//}
 			$division_filter_list_html .= "
 			<div class='form-check custom-control custom-checkbox' style='margin-bottom: 7px;'>
 			  <input class='custom-control-input division-options' type='checkbox' value='{$value}' id='divisionCheck{$division_count}' {$checked_checkbox}>
@@ -1149,14 +1763,6 @@ function job_list_func( $atts )
 		sort($state_arr);
 		foreach ($state_arr as $value)
 		{
-			// if (in_array($value, $session_state))
-			// {
-				// $checked_checkbox = "checked";	
-			// }
-			// else
-			// {
-				// $checked_checkbox = "";
-			// }
 			$state_filter_list_html .= "
 			<div class='form-check custom-control custom-checkbox' style='margin-bottom: 7px;'>
 			  <input class='custom-control-input state-options' type='checkbox' value='{$value}' id='stateCheck{$state_count}' {$checked_checkbox}>
@@ -1173,14 +1779,6 @@ function job_list_func( $atts )
 		$employment_count = 0;
 		foreach ($employment_arr as $value)
 		{
-			// if (in_array($value, $session_employment))
-			// {
-				// $checked_checkbox = "checked";	
-			// }
-			// else
-			// {
-				// $checked_checkbox = "";
-			// }
 			$employment_filter_list_html .= "
 			<div class='form-check custom-control custom-checkbox' style='margin-bottom: 7px;'>
 			  <input class='custom-control-input employment-options' type='checkbox' value='{$value}' id='employmentCheck{$employment_count}' {$checked_checkbox}>
@@ -1193,17 +1791,9 @@ function job_list_func( $atts )
 			$employment_count++;
 		}
 		
-		//if (!$from_session)
-		//{
-		//	$_SESSION["division_filter_list"] = json_encode($division_arr);
-		//	$_SESSION["state_filter_list"] = json_encode($state_arr);
-		//	$_SESSION["employment_filter_list"] = json_encode($employment_arr);
-		//}
-		
-		
 		if (!$filter_from_storage)
 		{
-			console_log('saving filters');
+			//console_log('saving filters');
 			$dt_now = date("Y-m-d H:i:s");
 			update_option("mindscope_webint_api_division_filter", json_encode($division_arr), TRUE);
 			update_option("mindscope_webint_api_state_filter", json_encode($state_arr), TRUE);
@@ -1440,38 +2030,5 @@ function console_log( $data ){
   echo 'console.log('. json_encode( $data ) .')';
   echo '</script>';
 }
- 
- /**
- CODE FOR LOGIN PAGE
- 	// $login_html = "
-	// <div class='container'>
-	// <div class='row'>
-	// <div class='col-sm text-center'>
-		// <div class='card'>
-			// <div class='card-body'>
-				// <div id='logreg-forms'>
-					// <p class='text-danger'>{$error_text}</p>
-					// <form class='form-signin' action='{$post_link}' method='post'>
-						// <input type='hidden' name='action' value='mindscope_webint_api_signin_form' />
-						// <h1 class='h3 mb-3 font-weight-normal' style='text-align: center'> Sign in</h1>
-						// <input type='email' id='inputEmail' name='signinEmail' class='form-control' placeholder='Email address' required='' autofocus=''>
-						// <br>
-						// <input type='password' id='inputPassword' name='signinPassword' class='form-control' placeholder='Password' required=''>
-						// <br>  
-						// <button class='btn btn-success btn-block' type='submit'><i class='fas fa-sign-in-alt'></i> Sign in</button>
-						// <a href='#' id='forgot_pswd'>Forgot password?</a>
-						// <hr>
-						// <!-- <p>Don't have an account!</p>  -->
-						// <button class='btn btn-primary btn-block' type='button' id='btn-signup' onclick=\"window.location.href='{$registration_link}';\"><i class='fas fa-user-plus'></i> Sign up New Account</button>
-						// </form>
-						// <br>
-				// </div>
-			// </div>
-		// </div>
-	// </div>
-	// </div>
-	// </div>
-	// ";
- */
 
 ?>
